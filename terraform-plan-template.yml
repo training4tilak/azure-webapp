@@ -1,0 +1,187 @@
+name: Terraform Plan Template
+
+on:
+  workflow_call:
+    inputs:
+      runsOn:
+        description: 'GitHub Actions runner type (e.g., azr-runner-linux, azr-runner-windows)'
+        required: true
+        type: string
+        default: 'azr-runner-linux'
+
+      environment:
+        description: 'Target environment for deployment or configuration (e.g., dev, qa, test, prod)'
+        required: true
+        type: string
+        default: 'dev'
+
+      tfrepository:
+        description: 'Terraform IAC Repository to download artifact from (e.g., owner/repo-name)'
+        required: true
+        type: string
+        default: '.'
+
+      tfymlWorkflowFilename:
+        description: 'Name of the Terraform IAC workflow file from which to download the artifacts.'
+        required: true
+        type: string
+        default: '.'
+
+      tfStorageAccountName:
+        description: 'Name of the Terraform Azure Storage Account to be created or used where state file will be stored'
+        required: true
+        type: string
+        default: '.'
+
+      tfResourceGroup:
+        description: 'Name of the Resource Group for Terraform Azure Storage Account where state file will be stored'
+        required: true
+        type: string
+        default: '.'
+
+      tfContainerName:
+        description: 'Name of the Terraform Azure Storage Container where state file will be stored'
+        required: true
+        type: string
+        default: '.'
+
+      location:
+        description: 'Azure region for resource deployment'
+        required: true
+        type: string
+        default: 'eastus2'
+
+      keyVaultName:
+        description: 'Name of the Azure Key Vault to fetch secrets from'
+        required: true
+        type: string
+        default: '.'
+
+      tfPlanName:
+        description: 'Name of the Terraform plan output file (without extension)'
+        required: true
+        type: string
+        default: '.'
+
+    secrets:
+      AZURE_CLIENT_ID:
+        description: 'Azure AD application (service principal) client ID for OIDC login'
+        required: true
+      
+      AZURE_TENANT_ID:
+        description: 'Azure AD tenant ID for OIDC login'
+        required: true
+
+      AZURE_SUBSCRIPTION_ID:
+        description: 'Azure subscription ID for OIDC login'
+        required: true
+
+      REPO_PAT:
+        description: 'Github Token to authenticate from another workflow'
+        required: true
+  
+jobs:
+  terraform-plan:
+    runs-on: ${{ inputs.runsOn }}
+    environment: ${{ inputs.environment }}
+    env:
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: 24 # or any version you need
+
+    - name: Install Azure CLI
+      run: |
+        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+    
+    - name: Login to Azure using OIDC
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Run Azure CLI command for Storage account creation
+      run: |
+        az storage account create \
+              --name "${{ inputs.tfStorageAccountName }}" \
+              --resource-group "${{ inputs.tfResourceGroup }}" \
+              --location "${{ inputs.location }}" \
+              --sku Standard_LRS
+        az storage container create \
+              --name "${{ inputs.tfContainerName }}" \
+              --account-name "${{ inputs.tfStorageAccountName }}"
+
+    - name: Get Storage Key using Azure CLI
+      shell: bash
+      run: |
+        key=$(az storage account keys list \
+              --resource-group "${{ inputs.tfResourceGroup }}" \
+              --account-name "${{ inputs.tfStorageAccountName }}" \
+              --query "[?keyName=='key1'].value" \
+              --output tsv)
+        echo "tfStorageKey=$key" >> $GITHUB_ENV
+
+    - name: Fetch secrets from Azure Key Vault
+      run: |
+        secrets=$(az keyvault secret list --vault-name ${{ inputs.keyVaultName }} --query "[].id" -o tsv)
+        for secret in $secrets; do
+          value=$(az keyvault secret show --id $secret --query "value" -o tsv)
+          name=$(basename $secret)
+          echo "::add-mask::$value"
+          echo "$name=$value" >> $GITHUB_ENV
+        done
+
+    - name: Get latest run-id
+      id: get_tf_run_id
+      run: |
+        run_id=$(curl -s -H "Authorization: token ${{ secrets.REPO_PAT }}" \
+          https://api.github.com/repos/${{ inputs.tfrepository }}/actions/workflows/${{ inputs.tfymlWorkflowFilename }}/runs?status=completed \
+          | jq '.workflow_runs[0].id')
+        echo "run_id=$run_id" >> $GITHUB_ENV
+    
+    - name: Download TF Artifact from Another Workflow
+      uses: actions/download-artifact@v5
+      with:
+        path: ${{ github.workspace }}/artifact
+        name: drop
+        run-id: ${{ env.run_id }}
+        repository: ${{ inputs.tfrepository }}
+        github-token: ${{ secrets.REPO_PAT }}
+    
+    - name: Replace tokens in Terraform and PowerShell files
+      uses: qetza/replacetokens-action@v1
+      with:
+        root: '${{ github.workspace }}/artifact'
+        sources: |
+          **/*.tf
+          **/*.ps1
+        token-pattern: 'doubleunderscores'
+        variables: '[${{ toJSON(vars) }},${{ toJSON(secrets) }},${{ toJSON(env) }}]'
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: latest
+    
+    - name: Terraform Init
+      shell: bash
+      working-directory: '${{ github.workspace }}/artifact'
+      run: terraform init
+
+    - name: Terraform Plan
+      shell: bash
+      working-directory: '${{ github.workspace }}/artifact'
+      run: terraform plan -no-color -out="${{ inputs.tfPlanName }}.tfplan"
+
+    - name: Upload Terraform Plan Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.tfPlanName }}
+        path: '${{ github.workspace }}/artifact/${{ inputs.tfPlanName }}.tfplan'

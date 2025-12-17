@@ -1,0 +1,134 @@
+name: .NET Deploy Template to Azure Web App
+
+on:
+  workflow_call:
+    inputs:       
+      runsOn:
+        description: 'GitHub Actions runner type (e.g., azr-runner-linux, azr-runner-windows)'
+        required: false
+        type: string
+        default: 'azr-runner-linux'
+
+      environment:
+        description: 'Target environment for deployment or configuration (e.g., dev, qa, test, prod)'
+        required: false
+        type: string
+        default: 'dev'
+
+      repository:
+        description: 'Repository to download artifact from (e.g., owner/repo-name)'
+        required: false
+        type: string
+        default: '.'
+
+      ymlWorkflowFilename:
+        description: 'Name of the workflow file (e.g., agency-service-dev-build.yml) from which to download the artifacts.'
+        required: false
+        type: string
+        default: '.'
+        
+      ARTIFACT_NAME:
+        description: The name of the artifact to download from a previous workflow run.
+        required: false
+        type: string
+        default: '.'
+        
+      ARTIFACT_PATH:
+        description: The local path where the artifact will be downloaded.
+        required: false
+        type: string
+        default: '.'
+        
+      PACKAGE_NAME:
+        description: The name of the zip file to create from the downloaded artifact.
+        required: false
+        type: string
+        default: '.'
+        
+      APP_NAME:
+        description: The name of the Azure Web App to deploy to.
+        required: false
+        type: string
+        default: '.'
+
+      APP_SETTINGS_JSON:
+        description: 'Additional application settings to configure in the Azure Web App (format: key1=value1;key2=value2)'
+        required: false
+        type: string
+        default: '.'
+
+    secrets:
+      AZURE_CLIENT_ID:
+        description: Azure AD application client ID used for OIDC authentication.
+        required: true
+        
+      AZURE_TENANT_ID:
+        description: Azure AD tenant ID used for OIDC authentication.
+        required: true
+        
+      AZURE_SUBSCRIPTION_ID:
+        description: Azure subscription ID where the Web App is hosted.
+        required: true
+
+      REPO_PAT:
+        description: 'Github Token to authenticate from another workflow'
+        required: false
+        
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runsOn }}
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Install zip (if needed)
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Get latest run-id to download .NET Artifact from another workflow
+        id: get_run_id
+        run: |
+          run_id=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ inputs.repository }}/actions/workflows/${{ inputs.ymlWorkflowFilename }}/runs?status=completed \
+            | jq '.workflow_runs[0].id') 
+          echo "run_id=$run_id" >> $GITHUB_ENV
+
+      - name: Download .NET Artifact from Another Workflow
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ inputs.ARTIFACT_NAME }}
+          path: ${{ inputs.ARTIFACT_PATH }}
+          run-id: ${{ env.run_id }}
+          repository: ${{ inputs.repository }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-zip the artifact
+        run: |
+          cd ${{ inputs.ARTIFACT_PATH }}
+          zip -r ${{ inputs.PACKAGE_NAME }} .
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configure Azure App Settings
+        id: settings
+        uses: Azure/appservice-settings@v1
+        with:
+          app-name: ${{ inputs.APP_NAME }}
+          app-settings-json: ${{ inputs.APP_SETTINGS_JSON }}
+          mask-inputs: false
+          
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ inputs.APP_NAME }}
+          package: ${{ inputs.ARTIFACT_PATH }}/${{ inputs.PACKAGE_NAME }}
